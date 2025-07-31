@@ -1,78 +1,185 @@
-import streamlit as st
-import numpy as np
-from tensorflow import keras
-from PIL import Image
-import joblib
 import os
+import re
+import json
+import joblib
+import numpy as np
+import streamlit as st
+from PIL import Image
+from tensorflow import keras
 
-# Constantes
+# ========================
+# Chemins / constantes
+# ========================
+# Modifie MODEL_PATH si ton .h5 a un autre nom
 MODEL_PATH = "models/vgg16_hypermodel.h5"
-LABELS_PATH = "models/labels.pkl"
-IMAGE_SIZE = (224, 224)
+LABELS_PATH = "models/labels"                # <-- ton fichier "labels" (joblib list)
+WNID_TO_NAME_PATH = "assets/wnid_to_name.json"  # optionnel (WNID -> nom lisible)
 
-def load_model(model_path):
-    return keras.models.load_model(model_path)
+# Pillow ≥ 10 : ANTIALIAS n'existe plus
+try:
+    RESAMPLE = Image.Resampling.LANCZOS
+except AttributeError:
+    RESAMPLE = Image.LANCZOS
 
-def load_labels(labels_path):
-    return joblib.load(labels_path)
+WNID_RE = re.compile(r"^n\d{8}$")
 
-def preprocess_image(image: Image.Image, target_size=(224, 224)) -> np.ndarray:
-    img = image.resize(target_size)
-    img_array = np.array(img) / 255.0
-    return np.expand_dims(img_array, axis=0)
+# ========================
+# Helpers divers
+# ========================
+def canonicalize(label: str) -> str:
+    s = label.strip().lower()
+    s = s.replace("-", "_").replace(" ", "_")
+    s = re.sub(r"_+", "_", s)
+    return s
 
-def predict(image: Image.Image, model, encoder):
-    processed_img = preprocess_image(image, IMAGE_SIZE)
-    prediction = model.predict(processed_img)
-    predicted_label = encoder.inverse_transform([np.argmax(prediction)])
-    return predicted_label[0]
-
-def extract_true_label(file_name):
-    # Récupère le nom de la race avant le premier '_'
+def extract_true_label_display_and_canonical(file_name: str, wnid_to_name: dict[str, str]):
+    """Retourne (affichage lisible, forme canonique) pour la 'race réelle' d'après le nom de fichier."""
     base = os.path.basename(file_name)
-    name_part = os.path.splitext(base)[0]
-    return name_part.split('_')[0].lower()
+    token = os.path.splitext(base)[0].split("_")[0].strip()
 
-# Interface
-st.set_page_config(page_title="Prédicteur de Race de Chien", page_icon="🐶", layout="centered")
-st.title("🐶 Prédicteur de race de chien")
-st.markdown("""
-Téléversez une ou plusieurs images de chiens.  
-Le nom du fichier doit contenir la race réelle, par exemple : `beagle_01.jpg`.
+    if WNID_RE.match(token) and wnid_to_name:
+        display = wnid_to_name.get(token, token)
+        return display, canonicalize(display)
 
-L'application affichera la **race réelle extraite du nom de fichier** et la **race prédite** par le modèle.
-""")
+    display = token.replace("-", " ").replace("_", "_")
+    return display, canonicalize(display)
 
-uploaded_files = st.file_uploader(
-    label="⬇️ Déposez vos images ici et cliquez sur 'Browse files'",
-    type=["jpg", "jpeg", "png"],
-    accept_multiple_files=True
-)
+# ========================
+# Chargements avec cache
+# ========================
+@st.cache_resource(show_spinner=False)
+def load_model(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Modèle introuvable : {path}")
+    return keras.models.load_model(path, compile=False)
 
-if uploaded_files:
+@st.cache_data(show_spinner=False)
+def load_labels(path: str) -> list[str]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Fichier de labels introuvable : {path}")
+    labels = joblib.load(path)  # ton fichier /models/labels est un joblib list
+    if not isinstance(labels, (list, tuple, np.ndarray)):
+        raise ValueError("Le fichier de labels doit contenir une liste/tuple/ndarray.")
+    return list(labels)
+
+@st.cache_data(show_spinner=False)
+def load_wnid_map(path: str) -> dict:
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+# ========================
+# Backbones supportés
+# ========================
+def get_preprocess_and_size(backbone: str):
+    b = (backbone or "").lower()
+    if b == "xception":
+        from tensorflow.keras.applications.xception import preprocess_input
+        return preprocess_input, (299, 299)
+    # défaut: VGG16
+    from tensorflow.keras.applications.vgg16 import preprocess_input
+    return preprocess_input, (224, 224)
+
+def infer_backbone_from_model(model) -> str:
+    """Devine le backbone via la taille d'entrée du modèle."""
+    h, w = model.input_shape[1:3]
+    if (h, w) == (224, 224):
+        return "VGG16"
+    if (h, w) == (299, 299):
+        return "Xception"
+    # fallback sûr
+    return "VGG16"
+
+# ========================
+# Prétraitement & prédiction
+# ========================
+def preprocess_image(image: Image.Image, size: tuple[int, int], preprocess_fn):
+    img = image.convert("RGB").resize(size, RESAMPLE)
+    x = keras.preprocessing.image.img_to_array(img)
+    x = preprocess_fn(x)
+    x = np.expand_dims(x, axis=0)
+    return x
+
+def predict_one(
+    image: Image.Image,
+    model,
+    labels: list[str],
+    preprocess_fn,
+    size: tuple[int, int],
+    topk: int = 5,
+):
+    """
+    Retourne (pred_label, confidence, probs, topk_list)
+    - probs: np.ndarray shape (1, n_classes)
+    - topk_list: [(label, prob), ...] trié décroissant
+    """
+    x = preprocess_image(image, size, preprocess_fn)
+    probs = model.predict(x)
+    idx = int(np.argmax(probs, axis=1)[0])
+    pred_label = labels[idx]
+    confidence = float(np.max(probs, axis=1)[0])
+
+    idxs = np.argsort(probs[0])[::-1][:topk]
+    topk_list = [(labels[i], float(probs[0][i])) for i in idxs]
+    return pred_label, confidence, probs, topk_list
+
+# ========================
+# UI Streamlit
+# ========================
+st.set_page_config(page_title="Prédicteur de race de chien à partir d'une image", page_icon="🐶", layout="centered")
+st.title("🐶 Prédicteur de race de chien à partir d'une image")
+
+uploaded = st.file_uploader("Veuillez charger une image", type=["jpg", "jpeg", "png"])
+
+if uploaded:
+    # Affiche l'image
+    img = Image.open(uploaded)
+    st.image(img, caption="Image chargée", width=350)
+
+    # Chargements
     try:
         model = load_model(MODEL_PATH)
-        encoder = load_labels(LABELS_PATH)
     except Exception as e:
-        st.error(f"Erreur lors du chargement du modèle : {e}")
+        st.error(f"Erreur chargement modèle: {e}")
         st.stop()
 
-    for idx, uploaded_file in enumerate(uploaded_files):
-        st.divider()
-        st.subheader(f"📷 Image {idx+1} : {uploaded_file.name}")
+    try:
+        labels = load_labels(LABELS_PATH)
+    except Exception as e:
+        st.error(f"Erreur chargement labels: {e}")
+        st.stop()
 
-        img = Image.open(uploaded_file)
-        st.image(img, caption="🖼️ Image chargée", use_column_width=True)
+    # Guardrail: nb classes cohérent
+    num_out = model.output_shape[-1]
+    if len(labels) != num_out:
+        st.error(
+            f"Incohérence labels vs modèle : labels={len(labels)} ≠ sorties_modèle={num_out}.\n"
+            f"Le fichier '{LABELS_PATH}' doit contenir exactement {num_out} classes dans le même ordre que l'entraînement."
+        )
+        st.stop()
 
-        real_race = extract_true_label(uploaded_file.name)
+    # Choix auto du backbone (prétraitement + taille)
+    forced_backbone = infer_backbone_from_model(model)
+    preprocess_fn, size = get_preprocess_and_size(forced_backbone)
+    st.caption(f"Backbone détecté automatiquement : **{forced_backbone}** (entrée {size[0]}×{size[1]}).")
 
-        with st.spinner("🔍 Prédiction en cours..."):
-            predicted_race = predict(img, model, encoder)
+    # Optionnel: afficher la "race réelle" (depuis nom de fichier)
+    wnid_to_name = load_wnid_map(WNID_TO_NAME_PATH)
+    real_display, real_canon = extract_true_label_display_and_canonical(uploaded.name, wnid_to_name)
+    st.info(f"🎯 **Race réelle (d'après le nom du fichier)** : {real_display}")
 
-        st.info(f"🎯 **Race réelle :** {real_race}")
-        st.success(f"✅ **Race prédite :** {predicted_race}")
+    if st.button("Lancer la détection de race"):
+        with st.spinner("Prédiction en cours..."):
+            pred, conf, probs, topk_list = predict_one(img, model, labels, preprocess_fn, size)
 
-        if real_race.lower() == predicted_race.lower():
-            st.success("✔️ La prédiction est correcte !")
+        st.success(f"✅ **Race prédite :** {pred} _(confiance {conf:.2%})_")
+        pred_canon = canonicalize(pred)
+        if real_canon and (real_canon == pred_canon):
+            st.success("✔️ La prédiction est **correcte**.")
         else:
-            st.warning("❌ La prédiction est incorrecte.")
+            st.warning("❌ La prédiction est **incorrecte**.")
+
+        with st.expander("Top‑5 des classes"):
+            for i, (name, p) in enumerate(topk_list, start=1):
+                st.write(f"{i}. {name} — {p:.2%}")
